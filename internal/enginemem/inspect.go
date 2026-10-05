@@ -39,6 +39,17 @@ func (m *Store) TruncateDailyFrom(plotCode string, from time.Time) {
 	m.stages[plotCode] = nil
 }
 
+// CorruptHistorical 绕过引擎事务直接往底层写若干历史行，模拟“整年导入
+// 写到一半进程被杀”（DELETE 已提交、INSERT 中断）后重启看到的物理残骸。
+// 测试用：正常路径永远通过 ReplaceHistoricalYear 整年写入。
+func (m *Store) CorruptHistorical(station string, year int, rows []model.HistoricalTemp) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range rows {
+		m.hist[histKey{station, dateKey(r.Date)}] = r
+	}
+}
+
 // Tx 是内存事务句柄类型，供泛型 engine 实例化使用。
 type Tx = *memTx
 

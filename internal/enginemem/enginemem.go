@@ -22,11 +22,15 @@ type Store struct {
 	obs       map[obsKey]model.Observation
 	stale     []model.Observation
 	normals   map[normalKey]model.ClimateNormal
+	hist      map[histKey]model.HistoricalTemp
 	daily     map[string][]model.DailyValue // plot -> 按日期
 	stages    map[string][]model.StageDate
 	events    []model.StageEvent
 	eventByID map[string]int64
 	eventSeq  int64
+	// failHistReplace 为 true 时 ReplaceHistoricalYear 在 DELETE 之后返回
+	// 错误，模拟整年导入写到一半事务失败（测试原子回滚用）。
+	failHistReplace bool
 	// UpdateCount 记录成功提交的写事务数（并发测试辅助）。
 	UpdateCount int
 }
@@ -39,6 +43,10 @@ type normalKey struct {
 	st  string
 	doy int
 }
+type histKey struct {
+	st string
+	d  time.Time
+}
 
 func New() *Store {
 	return &Store{
@@ -48,6 +56,7 @@ func New() *Store {
 		bindings:  map[string][]model.Binding{},
 		obs:       map[obsKey]model.Observation{},
 		normals:   map[normalKey]model.ClimateNormal{},
+		hist:      map[histKey]model.HistoricalTemp{},
 		daily:     map[string][]model.DailyValue{},
 		stages:    map[string][]model.StageDate{},
 		eventByID: map[string]int64{},
@@ -68,6 +77,7 @@ type memSnapshot struct {
 	obs       map[obsKey]model.Observation
 	stale     []model.Observation
 	normals   map[normalKey]model.ClimateNormal
+	hist      map[histKey]model.HistoricalTemp
 	daily     map[string][]model.DailyValue
 	stages    map[string][]model.StageDate
 	events    []model.StageEvent
@@ -87,6 +97,7 @@ func (m *Store) snapshotState() memSnapshot {
 	s.obs = cloneMap(m.obs)
 	s.stale = append([]model.Observation(nil), m.stale...)
 	s.normals = cloneMap(m.normals)
+	s.hist = cloneMap(m.hist)
 	s.daily = map[string][]model.DailyValue{}
 	for k, v := range m.daily {
 		s.daily[k] = append([]model.DailyValue(nil), v...)
@@ -111,7 +122,7 @@ func cloneMap[K comparable, V any](src map[K]V) map[K]V {
 func (m *Store) restore(s memSnapshot) {
 	m.stations, m.varieties, m.plots = s.stations, s.varieties, s.plots
 	m.bindings, m.obs, m.stale = s.bindings, s.obs, s.stale
-	m.normals, m.daily, m.stages = s.normals, s.daily, s.stages
+	m.normals, m.hist, m.daily, m.stages = s.normals, s.hist, s.daily, s.stages
 	m.events, m.eventByID, m.eventSeq = s.events, s.eventByID, s.eventSeq
 }
 

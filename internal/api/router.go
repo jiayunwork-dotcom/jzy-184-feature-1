@@ -41,6 +41,13 @@ func (s *Server[T]) Router() *gin.Engine {
 		// 观测批量写入
 		v1.POST("/observations/batch", s.ingestObservations)
 
+		// 历年资料导入（一站一年整体生效/替换）
+		v1.POST("/historical/batch", s.importHistorical)
+
+		// 历年试走范围与“某天之前达到的把握”
+		v1.GET("/plots/:code/outlook", s.plotOutlook)
+		v1.GET("/plots/:code/stage-probability", s.stageProbability)
+
 		// 查询
 		v1.GET("/plots/:code/daily", s.plotDaily)
 		v1.GET("/plots/:code/stages", s.plotStages)

@@ -1,0 +1,19 @@
+package main
+
+import (
+	"context"
+	"os"
+
+	"github.com/jackc/pgx/v5"
+)
+
+func main() {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, "postgres://agri@localhost:5439/postgres?sslmode=disable")
+	if err != nil { panic(err) }
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, "CREATE DATABASE agristation"); err != nil {
+		// 已存在则忽略
+		if os.Getenv("STRICT") != "" { panic(err) }
+	}
+}

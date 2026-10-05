@@ -16,6 +16,32 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// dstrQ 把日期格式化为 YYYY-MM-DD（查询用）。
+func dstrQ(t time.Time) string { return t.UTC().Format("2006-01-02") }
+
+// histYearRecords 生成某站某年的一整年历史记录（温度带年周期与随机项，
+// 两后端必须收到完全相同的内容）。
+func histYearRecords(station string, year int, warmBase, amp float64, seed int64) []engine.HistoricalInput {
+	r := rand.New(rand.NewSource(seed))
+	d0 := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+	days := 365
+	if time.Date(year, 2, 29, 0, 0, 0, 0, time.UTC).Day() == 29 {
+		days = 366
+	}
+	out := make([]engine.HistoricalInput, 0, days)
+	for i := 0; i < days; i++ {
+		d := d0.AddDate(0, 0, i)
+		season := 6.0 * r.Float64()
+		tmin := warmBase + season
+		tmax := tmin + amp
+		out = append(out, engine.HistoricalInput{
+			StationCode: station, Year: year,
+			Date: d.Format("2006-01-02"), TMax: tmax, TMin: tmin,
+		})
+	}
+	return out
+}
+
 // 该测试需要真实 PostgreSQL；未设置 DATABASE_URL 时跳过。
 // 本地：DATABASE_URL=postgres://agri@localhost:5439/agristation?sslmode=disable
 // Docker Compose：在 app 容器内指向 db 服务。
@@ -176,13 +202,53 @@ func TestPGParityAndRecovery(t *testing.T) {
 				t.Fatalf("%s: 阶段 %s 状态 pg=%s mem=%s", stage, ps[i].Stage, ps[i].Status, ms[i].Status)
 			}
 		}
+
+		// 历年试走范围：PG 与内存两后端逐项一致（含未到年与分位可达性）。
+		qs := []float64{0.1, 0.5, 0.9}
+		po, err := pgSvc.PlotOutlook(ctx, "P1", dstrQ(fixedNow), qs)
+		if err != nil {
+			// 没有任一历史年时两后端都应报 noHistory。
+			if _, e2 := memSvc.PlotOutlook(ctx, "P1", dstrQ(fixedNow), qs); e2 == nil {
+				t.Fatalf("%s: PG 报无历年但内存有结果：%v", stage, err)
+			}
+			return
+		}
+		mo := mem.ReferenceOutlook("P1", fixedNow, qs)
+		if len(po.Stages) != len(mo.Stages) {
+			t.Fatalf("%s: 试走阶段数 %d vs %d", stage, len(po.Stages), len(mo.Stages))
+		}
+		for i := range po.Stages {
+			g, w := po.Stages[i], mo.Stages[i]
+			if g.Status != w.Status || g.NYears != w.NYears ||
+				g.UnreachedYears != w.UnreachedYears {
+				t.Fatalf("%s: 阶段 %s 试走汇总不一致 pg=%+v mem=%+v",
+					stage, g.Stage, g, w)
+			}
+			if (g.Earliest == nil) != (w.Earliest == nil) ||
+				(g.Earliest != nil && !g.Earliest.Equal(*w.Earliest)) ||
+				(g.Latest != nil && w.Latest != nil && !g.Latest.Equal(*w.Latest)) {
+				t.Fatalf("%s: 阶段 %s 试走最早/最晚不一致", stage, g.Stage)
+			}
+			if len(g.Quantiles) != len(w.Quantiles) {
+				t.Fatalf("%s: 阶段 %s 分位数不一致", stage, g.Stage)
+			}
+			for j := range g.Quantiles {
+				if g.Quantiles[j].Q != w.Quantiles[j].Q ||
+					g.Quantiles[j].Reachable != w.Quantiles[j].Reachable ||
+					(g.Quantiles[j].Reachable &&
+						!g.Quantiles[j].Date.Equal(*w.Quantiles[j].Date)) {
+					t.Fatalf("%s: 阶段 %s 分位 %g 不一致",
+						stage, g.Stage, g.Quantiles[j].Q)
+				}
+			}
+		}
 	}
 
 	const steps = 200
 	for step := 0; step < steps; step++ {
 		off := rng.Intn(70)
 		day := ds(off)
-		switch rng.Intn(8) {
+		switch rng.Intn(9) {
 		case 0, 1, 2, 3:
 			key := "S1|" + day
 			seq := maxSeq[key] + 1
@@ -238,6 +304,25 @@ func TestPGParityAndRecovery(t *testing.T) {
 			if err := memSvc.BindPlot(ctx, in); err != nil {
 				t.Fatal(err)
 			}
+		case 8:
+			// 导入/整年替换某站某年的历年资料（PG 与内存同一份内容）。
+			st := "S1"
+			if rng.Intn(2) == 0 {
+				st = "S2"
+			}
+			y := 2000 + rng.Intn(6)
+			recs := histYearRecords(st, y,
+				5+rng.Float64()*15, 4+rng.Float64()*10, int64(y*131+rng.Intn(1000)))
+			if rng.Intn(4) == 0 {
+				// 极短年：大量缺日，走缺日策略。
+				recs = recs[:2]
+			}
+			if _, err := pgSvc.ImportHistorical(ctx, recs); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := memSvc.ImportHistorical(ctx, recs); err != nil {
+				t.Fatal(err)
+			}
 		}
 		compare(fmt.Sprintf("step %d", step))
 
@@ -271,6 +356,134 @@ func TestPGParityAndRecovery(t *testing.T) {
 			}
 			compare(fmt.Sprintf("step %d post-recover", step))
 		}
+	}
+}
+
+// TestPGHistoricalAtomicAndConcurrent 验证 PG 端历年资料的两个一致性
+// 保证：整年替换是单事务原子操作（行数始终等于某一次导入的整年天数），
+// 同站同年并发导入后最终内容完整等于其中一次。
+func TestPGHistoricalAtomicAndConcurrent(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := New(pool)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	svc := engine.NewService[Tx](st)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(svc.RegisterStation(ctx, model.Station{Code: "S1", Latitude: 30, Longitude: 100}))
+	must(svc.RegisterVariety(ctx, model.Variety{
+		Code: "V1", BaseTemp: 10, UpperTemp: 30,
+		Thresholds: []float64{30, 200, 400, 460, 800},
+	}))
+	sow := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	_, err := svc.RegisterPlot(ctx, model.Plot{
+		Code: "P1", SowDate: sow, Variety: "V1", Method: "mean",
+	}, "S1")
+	must(err)
+
+	yearRows := func(year int, tmax, tmin float64) []engine.HistoricalInput {
+		d0 := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+		days := 365
+		if time.Date(year, 2, 29, 0, 0, 0, 0, time.UTC).Day() == 29 {
+			days = 366
+		}
+		out := make([]engine.HistoricalInput, 0, days)
+		for i := 0; i < days; i++ {
+			d := d0.AddDate(0, 0, i)
+			out = append(out, engine.HistoricalInput{
+				StationCode: "S1", Year: year,
+				Date: d.Format("2006-01-02"), TMax: tmax, TMin: tmin,
+			})
+		}
+		return out
+	}
+
+	// 同站同年并发整年替换。
+	recsA := yearRows(2010, 25, 15)
+	recsB := yearRows(2010, 31, 21)
+	done := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		recs := recsA
+		if i%2 == 0 {
+			recs = recsB
+		}
+		go func() {
+			_, e := svc.ImportHistorical(ctx, recs)
+			done <- e
+		}()
+	}
+	for i := 0; i < 8; i++ {
+		must(<-done)
+	}
+
+	// 用只读事务直接核对：2010 年天数必须等于 365，且温度全部来自一次导入。
+	err = st.View(ctx, func(tx Tx) error {
+		rows, e := tx.ListHistoricalStationRows("S1")
+		if e != nil {
+			return e
+		}
+		if len(rows) != 365 {
+			t.Fatalf("并发整年替换后应为完整 365 行，got %d", len(rows))
+		}
+		allA, allB := true, true
+		for _, r := range rows {
+			if r.Year != 2010 {
+				t.Fatalf("只导入了 2010，出现 %d 年行", r.Year)
+			}
+			if r.TMax != 25 || r.TMin != 15 {
+				allA = false
+			}
+			if r.TMax != 31 || r.TMin != 21 {
+				allB = false
+			}
+		}
+		if !allA && !allB {
+			t.Fatal("并发导入后内容既不等于 A 也不等于 B")
+		}
+		return nil
+	})
+	must(err)
+
+	// 非法记录同站同年：整年不生效（2010 内容不应被破坏）。
+	bad := append(yearRows(2011, 24, 14), engine.HistoricalInput{
+		StationCode: "S1", Year: 2011, Date: "bad", TMax: 1, TMin: 1,
+	})
+	res, err := svc.ImportHistorical(ctx, bad)
+	must(err)
+	for _, y := range res.Years {
+		if y.StationCode == "S1" && y.Year == 2011 && y.Applied {
+			t.Fatal("含非法记录的站-年不应整体生效")
+		}
+	}
+	err = st.View(ctx, func(tx Tx) error {
+		rows, e := tx.ListHistoricalStationRows("S1")
+		if e != nil {
+			return e
+		}
+		if len(rows) != 365 {
+			t.Fatalf("非法组回滚后应仍只有 2010 的 365 行，got %d", len(rows))
+		}
+		return nil
+	})
+	must(err)
+
+	// 无任何历史时试走明确报错。
+	if err := svc.RegisterStation(ctx, model.Station{Code: "S9", Latitude: 30, Longitude: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.RegisterPlot(ctx, model.Plot{
+		Code: "P9", SowDate: sow, Variety: "V1", Method: "mean",
+	}, "S9"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PlotOutlook(ctx, "P9", "", nil); err == nil {
+		t.Fatal("无历年资料应明确报错")
 	}
 }
 
