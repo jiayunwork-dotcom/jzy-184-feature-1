@@ -117,6 +117,75 @@ type ClimateNormal struct {
 	TMin        float64 `json:"tmin"`
 }
 
+// HistoricalWeather 某站某一历年某日的逐日最高/最低气温，用于“把往年试走一遍”
+// 的年际范围推演。一站一年为一个整体导入单元：要么整年生效，要么整年不生效。
+type HistoricalWeather struct {
+	StationCode string  `json:"station_code"`
+	Year        int     `json:"year"`
+	Date        Date    `json:"date"`
+	TMax        float64 `json:"tmax"`
+	TMin        float64 `json:"tmin"`
+}
+
+// QuantilePoint 单个分位上的推演日期。
+type QuantilePoint struct {
+	Quantile float64 `json:"quantile"`
+	// Reachable 为 false 表示该分位在预测窗口内到不了（Date 为 nil），
+	// 必须如实告诉调用方，不能用最晚日或窗口末日顶替。
+	Reachable bool  `json:"reachable"`
+	Date      *Date `json:"date,omitempty"`
+}
+
+// StageRange 单个阶段的历年试走结果。
+type StageRange struct {
+	Stage     Stage   `json:"stage"`
+	Threshold float64 `json:"threshold"`
+	// Available 为 false 表示这一个阶段给不出年际范围（未达到且没有可用
+	// 历年），Reason 说明原因；已实际达到的阶段始终 Available。
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+	// Reached 为 true 表示本季该阶段已实际达到：范围收成 ActualDate 一天，
+	// 各分位同日，不受历年资料影响。
+	Reached    bool  `json:"reached"`
+	ActualDate *Date `json:"actual_date,omitempty"`
+	YearsUsed  int   `json:"years_used"` // 实际参与试走的历年数
+	Years      []int `json:"years"`      // 参与试走的年份列表（升序）
+	Earliest   *Date `json:"earliest,omitempty"`
+	Latest     *Date `json:"latest,omitempty"`
+	// NotReachedYears 在预测窗口内始终没达到该阶段的参与年数；这些年份
+	// 不能丢掉，否则范围会显得比实际窄。
+	NotReachedYears int             `json:"not_reached_years"`
+	Quantiles       []QuantilePoint `json:"quantiles"`
+}
+
+// StageRangesResult 一块地全部阶段的历年试走结果。
+// Available 为 false 时 Ranges 为空、Reason 说明原因（例如一块地连一年
+// 历年资料都没有），接口不能回一个看起来正常的空结果。
+type StageRangesResult struct {
+	PlotCode  string       `json:"plot_code"`
+	AsOf      Date         `json:"as_of"`
+	Horizon   Date         `json:"horizon"`
+	Available bool         `json:"available"`
+	Reason    string       `json:"reason,omitempty"`
+	Ranges    []StageRange `json:"ranges"`
+}
+
+// ArrivalResult “给定某天之前有多大比例年份到达”的查询结果。
+// 已实际达到的阶段：比例在实际达到日之前为 0、当天起为 1。
+type ArrivalResult struct {
+	PlotCode   string `json:"plot_code"`
+	Stage      Stage  `json:"stage"`
+	By         Date   `json:"by"`
+	AsOf       Date   `json:"as_of"`
+	Available  bool   `json:"available"`
+	Reason     string `json:"reason,omitempty"`
+	YearsUsed  int    `json:"years_used"`
+	Reached    bool   `json:"reached"` // 本季该阶段已实际达到
+	ActualDate *Date  `json:"actual_date,omitempty"`
+	// Fraction 为在 By 当天或之前到达的年份比例（含已达到阶段收成 0/1）。
+	Fraction float64 `json:"fraction"`
+}
+
 // Source 数据来源标记。
 type Source string
 

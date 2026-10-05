@@ -87,3 +87,26 @@ func (t *pgTx) GetClimate(station string, doy int) (*model.ClimateNormal, error)
 	}
 	return &c, nil
 }
+
+// ListClimateNormals 一次取回给定站点集合的全部 DOY 气候平均（供试走批量预载）。
+func (t *pgTx) ListClimateNormals(stations []string) ([]model.ClimateNormal, error) {
+	if len(stations) == 0 {
+		return nil, nil
+	}
+	rows, err := t.tx.Query(t.ctx, `
+		SELECT station_code,doy,tmax,tmin FROM climate_normals
+		WHERE station_code = ANY($1) ORDER BY station_code,doy`, stations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.ClimateNormal
+	for rows.Next() {
+		var c model.ClimateNormal
+		if err := rows.Scan(&c.StationCode, &c.DOY, &c.TMax, &c.TMin); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}

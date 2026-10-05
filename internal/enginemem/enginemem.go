@@ -14,19 +14,20 @@ import (
 //
 // Update 在共享状态上执行，fn 返回 error 时用快照回滚，语义与数据库事务一致。
 type Store struct {
-	mu        sync.Mutex
-	stations  map[string]model.Station
-	varieties map[string]model.Variety
-	plots     map[string]model.Plot
-	bindings  map[string][]model.Binding // plot -> 按生效日
-	obs       map[obsKey]model.Observation
-	stale     []model.Observation
-	normals   map[normalKey]model.ClimateNormal
-	daily     map[string][]model.DailyValue // plot -> 按日期
-	stages    map[string][]model.StageDate
-	events    []model.StageEvent
-	eventByID map[string]int64
-	eventSeq  int64
+	mu         sync.Mutex
+	stations   map[string]model.Station
+	varieties  map[string]model.Variety
+	plots      map[string]model.Plot
+	bindings   map[string][]model.Binding // plot -> 按生效日
+	obs        map[obsKey]model.Observation
+	stale      []model.Observation
+	normals    map[normalKey]model.ClimateNormal
+	historical map[histKey]model.HistoricalWeather
+	daily      map[string][]model.DailyValue // plot -> 按日期
+	stages     map[string][]model.StageDate
+	events     []model.StageEvent
+	eventByID  map[string]int64
+	eventSeq   int64
 	// UpdateCount 记录成功提交的写事务数（并发测试辅助）。
 	UpdateCount int
 }
@@ -39,18 +40,23 @@ type normalKey struct {
 	st  string
 	doy int
 }
+type histKey struct {
+	st string
+	d  time.Time
+}
 
 func New() *Store {
 	return &Store{
-		stations:  map[string]model.Station{},
-		varieties: map[string]model.Variety{},
-		plots:     map[string]model.Plot{},
-		bindings:  map[string][]model.Binding{},
-		obs:       map[obsKey]model.Observation{},
-		normals:   map[normalKey]model.ClimateNormal{},
-		daily:     map[string][]model.DailyValue{},
-		stages:    map[string][]model.StageDate{},
-		eventByID: map[string]int64{},
+		stations:   map[string]model.Station{},
+		varieties:  map[string]model.Variety{},
+		plots:      map[string]model.Plot{},
+		bindings:   map[string][]model.Binding{},
+		obs:        map[obsKey]model.Observation{},
+		normals:    map[normalKey]model.ClimateNormal{},
+		historical: map[histKey]model.HistoricalWeather{},
+		daily:      map[string][]model.DailyValue{},
+		stages:     map[string][]model.StageDate{},
+		eventByID:  map[string]int64{},
 	}
 }
 
@@ -61,18 +67,19 @@ func dateKey(t time.Time) time.Time {
 
 // snapshot 用于事务回滚。
 type memSnapshot struct {
-	stations  map[string]model.Station
-	varieties map[string]model.Variety
-	plots     map[string]model.Plot
-	bindings  map[string][]model.Binding
-	obs       map[obsKey]model.Observation
-	stale     []model.Observation
-	normals   map[normalKey]model.ClimateNormal
-	daily     map[string][]model.DailyValue
-	stages    map[string][]model.StageDate
-	events    []model.StageEvent
-	eventByID map[string]int64
-	eventSeq  int64
+	stations   map[string]model.Station
+	varieties  map[string]model.Variety
+	plots      map[string]model.Plot
+	bindings   map[string][]model.Binding
+	obs        map[obsKey]model.Observation
+	stale      []model.Observation
+	normals    map[normalKey]model.ClimateNormal
+	historical map[histKey]model.HistoricalWeather
+	daily      map[string][]model.DailyValue
+	stages     map[string][]model.StageDate
+	events     []model.StageEvent
+	eventByID  map[string]int64
+	eventSeq   int64
 }
 
 func (m *Store) snapshotState() memSnapshot {
@@ -87,6 +94,7 @@ func (m *Store) snapshotState() memSnapshot {
 	s.obs = cloneMap(m.obs)
 	s.stale = append([]model.Observation(nil), m.stale...)
 	s.normals = cloneMap(m.normals)
+	s.historical = cloneMap(m.historical)
 	s.daily = map[string][]model.DailyValue{}
 	for k, v := range m.daily {
 		s.daily[k] = append([]model.DailyValue(nil), v...)
@@ -111,7 +119,8 @@ func cloneMap[K comparable, V any](src map[K]V) map[K]V {
 func (m *Store) restore(s memSnapshot) {
 	m.stations, m.varieties, m.plots = s.stations, s.varieties, s.plots
 	m.bindings, m.obs, m.stale = s.bindings, s.obs, s.stale
-	m.normals, m.daily, m.stages = s.normals, s.daily, s.stages
+	m.normals, m.historical = s.normals, s.historical
+	m.daily, m.stages = s.daily, s.stages
 	m.events, m.eventByID, m.eventSeq = s.events, s.eventByID, s.eventSeq
 }
 
@@ -252,6 +261,82 @@ func (t *memTx) GetClimate(station string, doy int) (*model.ClimateNormal, error
 		return &cp, nil
 	}
 	return nil, nil
+}
+
+func (t *memTx) ListClimateNormals(stations []string) ([]model.ClimateNormal, error) {
+	want := map[string]bool{}
+	for _, s := range stations {
+		want[s] = true
+	}
+	out := make([]model.ClimateNormal, 0)
+	for _, n := range t.m.normals {
+		if want[n.StationCode] {
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StationCode != out[j].StationCode {
+			return out[i].StationCode < out[j].StationCode
+		}
+		return out[i].DOY < out[j].DOY
+	})
+	return out, nil
+}
+
+// ---------- 历年逐日气温 ----------
+
+func (t *memTx) ListHistoricalYears(station string) ([]int, error) {
+	seen := map[int]struct{}{}
+	for k := range t.m.historical {
+		if k.st == station {
+			seen[k.d.Year()] = struct{}{}
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for y := range seen {
+		out = append(out, y)
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+func (t *memTx) ListHistoricalStationYear(station string, year int) ([]model.HistoricalWeather, error) {
+	out := make([]model.HistoricalWeather, 0)
+	for _, h := range t.m.historical {
+		if h.StationCode == station && h.Year == year {
+			out = append(out, h)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Date.Before(out[j].Date) })
+	return out, nil
+}
+
+func (t *memTx) ListHistorical(stations []string, from, to model.Date) ([]model.HistoricalWeather, error) {
+	want := map[string]bool{}
+	for _, s := range stations {
+		want[s] = true
+	}
+	out := make([]model.HistoricalWeather, 0)
+	for _, h := range t.m.historical {
+		if !want[h.StationCode] || h.Date.Before(from) || h.Date.After(to) {
+			continue
+		}
+		out = append(out, h)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Date.Before(out[j].Date) })
+	return out, nil
+}
+
+func (t *memTx) ReplaceHistoricalStationYear(station string, year int, rows []model.HistoricalWeather) error {
+	for k := range t.m.historical {
+		if k.st == station && k.d.Year() == year {
+			delete(t.m.historical, k)
+		}
+	}
+	for _, r := range rows {
+		t.m.historical[histKey{r.StationCode, dateKey(r.Date)}] = r
+	}
+	return nil
 }
 
 func (t *memTx) CumulativeBefore(plot string, d model.Date) (float64, error) {

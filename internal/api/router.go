@@ -40,10 +40,15 @@ func (s *Server[T]) Router() *gin.Engine {
 
 		// 观测批量写入
 		v1.POST("/observations/batch", s.ingestObservations)
+		// 历年逐日气温整年导入/替换
+		v1.POST("/historical/batch", s.ingestHistorical)
 
 		// 查询
 		v1.GET("/plots/:code/daily", s.plotDaily)
 		v1.GET("/plots/:code/stages", s.plotStages)
+		// 历年试走：阶段日期范围/分位，以及“某天前到达比例”
+		v1.GET("/plots/:code/stage-ranges", s.stageRanges)
+		v1.GET("/plots/:code/arrival", s.arrival)
 
 		// 变更事件
 		v1.GET("/events", s.listEvents)

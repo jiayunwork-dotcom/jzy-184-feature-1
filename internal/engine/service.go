@@ -51,6 +51,19 @@ type Tx interface {
 
 	// 气候平均
 	GetClimate(station string, doy int) (*model.ClimateNormal, error)
+	// ListClimateNormals 一次取回给定站点集合的全部气候平均（供试走批量预载）。
+	ListClimateNormals(stations []string) ([]model.ClimateNormal, error)
+
+	// 历年逐日气温（按日精确匹配；不参与现有单点预测与快照）
+	// ListHistoricalYears 返回某站存在整年资料的年份集合（升序）。
+	ListHistoricalYears(station string) ([]int, error)
+	// ListHistoricalStationYear 返回某站某年全部记录（按日期升序）。
+	ListHistoricalStationYear(station string, year int) ([]model.HistoricalWeather, error)
+	// ListHistorical 返回 stations 中任一站、date 在 [from,to] 内的记录。
+	ListHistorical(stations []string, from, to model.Date) ([]model.HistoricalWeather, error)
+	// ReplaceHistoricalStationYear 在同一事务内整年替换：先删后插。
+	// rows 为该站该年最终完整内容（可为空切片，表示清空该年）。
+	ReplaceHistoricalStationYear(station string, year int, rows []model.HistoricalWeather) error
 
 	// 快照与结果
 	CumulativeBefore(plot string, d model.Date) (float64, error) // d 之前最近一行的累计值；无则 0

@@ -39,8 +39,26 @@ func (m *Store) TruncateDailyFrom(plotCode string, from time.Time) {
 	m.stages[plotCode] = nil
 }
 
-// Tx 是内存事务句柄类型，供泛型 engine 实例化使用。
+// Tx 是内存事务句柄，供泛型 engine 实例化使用。
 type Tx = *memTx
+
+// HistoricalRows 返回某站某年全部历年记录（按日期升序），供测试/检查使用。
+func (m *Store) HistoricalRows(station string, year int) []model.HistoricalWeather {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tx := &memTx{m: m}
+	out, _ := tx.ListHistoricalStationYear(station, year)
+	return out
+}
+
+// HistoricalYears 返回某站存在资料的年份集合。
+func (m *Store) HistoricalYears(station string) []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tx := &memTx{m: m}
+	out, _ := tx.ListHistoricalYears(station)
+	return out
+}
 
 // LatestAsOf 返回所有地块快照里最大的 as_of（engine.Tx 方法）。
 func (t *memTx) LatestAsOf() (model.Date, error) {

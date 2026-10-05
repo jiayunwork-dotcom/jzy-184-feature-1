@@ -19,7 +19,11 @@ const ForecastDays = 270
 func (m *Store) ReferenceDaily(plotCode string, asOf time.Time) []model.DailyValue {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.referenceDailyLocked(plotCode, asOf)
+}
 
+// referenceDailyLocked 与 ReferenceDaily 相同，但不加锁，供同一把锁内复用。
+func (m *Store) referenceDailyLocked(plotCode string, asOf time.Time) []model.DailyValue {
 	p := m.plots[plotCode]
 	v := m.varieties[p.Variety]
 	method, _ := gdd.ParseMethod(p.Method)
